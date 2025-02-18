@@ -1,0 +1,106 @@
+#include "main.h"
+#include "i2c.h"  // Dùng cho BH1750
+#include "usart.h" // Debug qua UART
+#include "gpio.h"  // Điều khiển thiết bị
+#include "tim.h"   // Dùng cho delay chính xác
+#include "esp8266.h" // Kết nối Wi-Fi (giả lập thư viện)
+#include "watchdog.h" // Watchdog Timer để tránh treo hệ thống
+
+#define LIGHT_THRESHOLD  300  // Ngưỡng ánh sáng (lux)
+#define TEMP_THRESHOLD   30   // Ngưỡng nhiệt độ (°C)
+
+// Biến toàn cục
+uint8_t dht_data[5];  // Dữ liệu từ DHT11
+uint16_t lux;         // Giá trị ánh sáng từ BH1750
+uint8_t motion_detected; // Trạng thái từ PIR
+uint8_t temperature;
+
+// Hàm gửi dữ liệu qua UART
+void UART_SendData(char *message) {
+    HAL_UART_Transmit(&huart2, (uint8_t*)message, strlen(message), 100);
+}
+
+// Hàm đọc BH1750
+uint16_t BH1750_ReadLight() {
+    uint8_t data[2];
+    if (HAL_I2C_Master_Receive(&hi2c1, 0x23 << 1, data, 2, 100) != HAL_OK) {
+        return 0; // Trả về 0 nếu đọc lỗi
+    }
+    return ((data[0] << 8) | data[1]) / 1.2;
+}
+
+// Hàm đọc DHT11 với kiểm tra lỗi
+uint8_t DHT11_ReadData(uint8_t *temperature) {
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_RESET);
+    HAL_Delay(18);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5, GPIO_PIN_SET);
+    HAL_Delay(40);
+    
+    for (int i = 0; i < 5; i++) {
+        dht_data[i] = 0;
+    }
+    *temperature = dht_data[2];
+    
+    if (*temperature == 0) {
+        return 0; // Lỗi khi đọc
+    }
+    return 1;
+}
+
+// Gửi dữ liệu lên Wi-Fi với kiểm tra lỗi
+void SendDataToCloud(uint16_t light, uint8_t temp, uint8_t motion) {
+    char buffer[100];
+    sprintf(buffer, "Light: %d lux, Temp: %d°C, Motion: %d\r\n", light, temp, motion);
+    if (ESP8266_Send(buffer) != 1) {
+        UART_SendData("Wi-Fi Error\r\n");
+    }
+}
+
+// Main Loop
+int main(void) {
+    HAL_Init();
+    SystemClock_Config();
+    MX_GPIO_Init();
+    MX_I2C1_Init();
+    MX_USART2_UART_Init();
+    MX_TIM2_Init();
+    ESP8266_Init();
+    Watchdog_Init();
+
+    while (1) {
+        Watchdog_Reset(); // Reset watchdog tránh treo
+
+        lux = BH1750_ReadLight();
+        if (!DHT11_ReadData(&temperature)) {
+            UART_SendData("DHT11 Error\r\n");
+        }
+        motion_detected = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_1);
+
+        static uint8_t motion_stable = 0;
+        if (motion_detected) {
+            motion_stable++;
+        } else {
+            motion_stable = 0;
+        }
+        
+        if (lux < LIGHT_THRESHOLD && motion_stable > 3) {
+            HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
+        } else {
+            HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
+        }
+        
+        if (temperature > TEMP_THRESHOLD) {
+            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET);
+        } else {
+            HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET);
+        }
+        
+        char debugMsg[100];
+        sprintf(debugMsg, "Light: %d lux, Temp: %d°C, Motion: %d\r\n", lux, temperature, motion_detected);
+        UART_SendData(debugMsg);
+        
+        SendDataToCloud(lux, temperature, motion_detected);
+        
+        HAL_Delay(1000);
+    }
+}
